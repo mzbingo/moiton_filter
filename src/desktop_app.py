@@ -46,7 +46,7 @@ class App:
             except (ValueError,OSError):pass
         self.paths={key:tk.StringVar(value=settings.get(key,str(default))) for key,default in {
             'reference':self.root/'input/reference_video','source':self.root/'input/waiting_for_filter_videos',
-            'output':self.root/'output'}.items()}
+            'output':self.root/'output','excluded':self.root/'manual_excluded'}.items()}
         self.mode=tk.StringVar(value=settings.get('mode','标准（推荐）'))
         self.archive=tk.BooleanVar(value=settings.get('archive',True))
         self.refresh=tk.BooleanVar(value=False)
@@ -106,7 +106,7 @@ class App:
         setup.pack(fill='x',pady=(0,12))
         setup.columnconfigure(1,weight=1)
         self.counts={}
-        for i,(key,label) in enumerate([('reference','参考视频目录'),('source','待筛选目录'),('output','输出目录')]):
+        for i,(key,label) in enumerate([('reference','参考视频目录'),('source','待筛选目录'),('output','输出目录'),('excluded','手动排除目录')]):
             ttk.Label(setup,text=label,style='Card.TLabel',width=14).grid(row=i,column=0,sticky='w',pady=5)
             entry=ttk.Entry(setup,textvariable=self.paths[key])
             entry.grid(row=i,column=1,sticky='ew',padx=(5,10),pady=5)
@@ -173,12 +173,13 @@ class App:
         self.table.tag_configure('manual_kept',foreground='#16805b')
         self.table.tag_configure('error',foreground='#c43c46')
         actions=ttk.Frame(left,style='Card.TFrame')
-        actions.pack(fill='x',pady=(10,0))
-        self.keep_button=ttk.Button(actions,text='保留选中',command=lambda:self.review('keep'))
+        actions.pack(fill='x',pady=(8,4),before=searchrow)
+        self.keep_button=ttk.Button(actions,text='确认保留选中',style='Primary.TButton',command=lambda:self.review('keep'))
         self.keep_button.pack(side='left')
-        self.exclude_button=ttk.Button(actions,text='排除选中',command=lambda:self.review('exclude'))
+        self.exclude_button=ttk.Button(actions,text='确认排除选中',command=lambda:self.review('exclude'))
         self.exclude_button.pack(side='left',padx=6)
-        ttk.Label(actions,text='Ctrl / Shift 可多选',style='Card.TLabel',foreground=MUTED).pack(side='right')
+        self.review_hint=ttk.Label(actions,text='选择视频即可手动确认 · Ctrl 多选',style='Card.TLabel',foreground=MUTED)
+        self.review_hint.pack(side='left',padx=(8,0))
         tabs=ttk.Notebook(right)
         tabs.pack(fill='both',expand=True)
         preview=ttk.Frame(tabs,style='Card.TFrame',padding=8)
@@ -205,14 +206,15 @@ class App:
         self.log_widget.pack(fill='both',expand=True)
         footer=ttk.Frame(main)
         footer.pack(fill='x',pady=(10,0))
-        ttk.Label(footer,text='衣着看不清的片段请检查「待确认」。排除操作会备份输出文件，原视频不变。',style='Muted.TLabel').pack(side='left')
+        ttk.Label(footer,text='排除的视频原样复制到手动排除目录，重跑时跳过；原视频不变。',style='Muted.TLabel').pack(side='left')
+        ttk.Button(footer,text='打开手动排除',command=lambda:self._open(self.paths['excluded'].get())).pack(side='right',padx=6)
         ttk.Button(footer,text='打开复核报告',command=self.open_report).pack(side='right')
         ttk.Button(footer,text='打开备份',command=self.open_backup).pack(side='right',padx=6)
         self.update_counts()
 
     def browse(self,key):
         initial=self.paths[key].get()
-        chosen=filedialog.askdirectory(title='选择'+{'reference':'参考视频目录','source':'待筛选目录','output':'输出目录'}[key],initialdir=initial if Path(initial).is_dir() else self.root)
+        chosen=filedialog.askdirectory(title='选择'+{'reference':'参考视频目录','source':'待筛选目录','output':'输出目录','excluded':'手动排除目录'}[key],initialdir=initial if Path(initial).is_dir() else self.root)
         if chosen:self.paths[key].set(chosen);self.update_counts()
 
     def update_counts(self):
@@ -224,7 +226,7 @@ class App:
         try:
             threshold={'标准（推荐）':.72,'更严格':.78,'更宽松（多选）':.68}[self.mode.get()]
             self.controller.start(*(self.paths[k].get() for k in ('reference','source','output')),
-                threshold=threshold,refresh=self.refresh.get(),archive=self.archive.get())
+                threshold=threshold,refresh=self.refresh.get(),archive=self.archive.get(),excluded=self.paths['excluded'].get())
             save_json(self.root/'runtime/gui_settings.json',{
                 **{k:v.get() for k,v in self.paths.items()},'mode':self.mode.get(),'archive':self.archive.get()})
         except Exception as exc:
@@ -240,6 +242,7 @@ class App:
         self.progress_text.set('读取模型和参考人物时，窗口仍可正常操作')
 
     def set_running(self,running):
+        self.review_hint.configure(text='筛选完成或停止后可确认' if running else '选择视频即可手动确认 · Ctrl 多选')
         self.start_button.configure(state='disabled' if running else 'normal')
         self.stop_button.configure(state='normal' if running else 'disabled')
         self.keep_button.configure(state='disabled' if running else 'normal')
@@ -349,7 +352,11 @@ class App:
             messagebox.showinfo('先选择视频','点击列表选择视频，Ctrl / Shift 可以多选。',parent=self.window)
             return
         try:
+            self.player.stop();self.playing=False
+            self.controller.excluded=Path(self.paths['excluded'].get()).resolve()
             done=self.controller.review(rows,decision)
+            save_json(self.root/'runtime/gui_settings.json',{
+                **{k:v.get() for k,v in self.paths.items()},'mode':self.mode.get(),'archive':self.archive.get()})
             self.status.set(f'已{ "保留" if decision=="keep" else "排除" } {len(done)} 段视频；本轮复核决定已保存')
             self.render_rows();self.update_counts()
         except Exception as exc:
@@ -367,7 +374,7 @@ class App:
     def _loaded(self,update_paths=False):
         summary=self.controller.summary
         if update_paths:
-            for key,field in [('reference','reference_dir'),('source','input_dir'),('output','output_dir')]:
+            for key,field in [('reference','reference_dir'),('source','input_dir'),('output','output_dir'),('excluded','excluded_dir')]:
                 if summary.get(field):self.paths[key].set(summary[field])
         self.filter('已保留')
         self.progress.configure(maximum=max(1,summary.get('total',len(self.controller.rows))),value=len(self.controller.rows))
@@ -463,6 +470,7 @@ class App:
             elif kind=='finished':
                 self.controller.summary=event
                 self.status.set(('已停止' if event['cancelled'] else '筛选完成')+f' · 已检查 {event["processed"]} 段 · 已保留 {event["copied"]} 段')
+                if event.get('skipped_excluded'):self.status.set(self.status.get()+f' · 跳过已排除 {event["skipped_excluded"]} 段')
                 if event['errors']:self.status.set(self.status.get()+f' · {event["errors"]} 段异常需检查')
                 self.log(self.status.get())
             elif kind=='exit':

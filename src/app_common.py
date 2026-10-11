@@ -61,6 +61,25 @@ class ReviewStore:
             'source':str(Path(source).resolve()),'decision':decision,'updated':time.strftime('%Y-%m-%d %H:%M:%S')}
         save_json(self.path,data)
 
+    def excluded_sources(self):
+        return {key for key,value in self._load().get(self.target_id,{}).items()
+                if value.get('decision')=='exclude'}
+
+
+def pending_videos(candidates,store):
+    excluded=store.excluded_sources() if store else set()
+    pending=[p for p in candidates if source_identity(p) not in excluded]
+    return pending,len(candidates)-len(pending)
+
+
+def validate_excluded_folder(excluded,*folders):
+    excluded=Path(excluded).resolve()
+    for folder in folders:
+        folder=Path(folder).resolve()
+        if excluded==folder or excluded.is_relative_to(folder) or folder.is_relative_to(excluded):
+            raise ValueError('手动排除目录必须与参考、待筛选、输出目录分开，不能互相包含')
+    return excluded
+
 
 def copy_exact(source,destination):
     source,destination=Path(source),Path(destination)

@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'src'))
-from app_common import ReviewStore,copy_exact,load_report,persist_report,validate_folders
+from app_common import ReviewStore,copy_exact,load_report,persist_report,validate_folders,pending_videos
 from desktop_controller import DesktopController
 
 
@@ -22,11 +22,12 @@ class DesktopTests(unittest.TestCase):
     def test_manual_review_copies_backs_up_and_persists_reports(self):
         with tempfile.TemporaryDirectory() as folder:
             root=Path(folder);report=root/'report';report.mkdir()
-            source=root/'clip.ts';source.write_bytes(b'original-video-bytes')
+            inputs=root/'input';inputs.mkdir()
+            source=inputs/'clip.ts';source.write_bytes(b'original-video-bytes')
             row=dict(file='clip.ts',status='review',score=.7,reid_similarity=.7,color_similarity=0,
                 upper_color=.6,lower_color=.7,support_frames=1,time_seconds=2.,track_id=1,detections=2,
                 copied=False,evidence='',error='',source_path=str(source),manual_decision='')
-            summary=dict(input_dir=str(root),output_dir=str(root/'output'),target_id='target')
+            summary=dict(input_dir=str(inputs),output_dir=str(root/'output'),target_id='target')
             persist_report([row],report,summary)
             controller=DesktopController(root);controller.load(report)
             controller.review(controller.rows,'keep')
@@ -38,7 +39,12 @@ class DesktopTests(unittest.TestCase):
             controller.load(report)
             self.assertEqual(controller.rows[0]['status'],'manual_excluded')
             self.assertEqual(controller.store.get(source),'exclude')
+            self.assertEqual((root/'manual_excluded/clip.ts').read_bytes(),source.read_bytes())
+            self.assertEqual(pending_videos([source],controller.store),([],1))
             self.assertIn('manual_excluded',(report/'review.html').read_text(encoding='utf-8'))
+            controller.review(controller.rows,'keep')
+            self.assertFalse((root/'manual_excluded/clip.ts').exists())
+            self.assertEqual(pending_videos([source],controller.store),([source],0))
 
     def test_outputs_cannot_overlap_inputs_or_overwrite_different_content(self):
         with tempfile.TemporaryDirectory() as folder:

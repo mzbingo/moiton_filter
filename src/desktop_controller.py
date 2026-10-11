@@ -10,7 +10,8 @@ import uuid
 from pathlib import Path
 from filelock import FileLock,Timeout
 from app_common import (ReviewStore,app_root,copy_exact,load_report,remove_from_output,
-                        save_json,persist_report,target_identity,validate_folders,video_files)
+                        save_json,persist_report,target_identity,validate_folders,video_files,
+                        pending_videos,validate_excluded_folder)
 
 HIDDEN=getattr(subprocess,'CREATE_NO_WINDOW',0)
 
@@ -25,6 +26,7 @@ class DesktopController:
         self.thread=None
         self.report=None
         self.output=None
+        self.excluded=None
         self.stop_file=None
         self.log_file=None
         self.rows=[]
@@ -39,6 +41,7 @@ class DesktopController:
         self.report=Path(report)
         self.summary,self.rows=load_report(self.report)
         self.output=Path(self.summary.get('output_dir',self.root/'output'))
+        self.excluded=Path(self.summary.get('excluded_dir',self.root/'manual_excluded'))
         source=Path(self.summary.get('input_dir',self.root/'input/waiting_for_filter_videos'))
         references=Path(self.summary.get('reference_dir',self.root/'input/reference_video'))
         identity=self.summary.get('target_id')
@@ -63,10 +66,14 @@ class DesktopController:
                 return self.load(report)
         return None
 
-    def start(self,reference,source,output,threshold=.72,refresh=False,archive=True,limit=0,no_latest=False):
+    def start(self,reference,source,output,threshold=.72,refresh=False,archive=True,limit=0,no_latest=False,excluded=None):
         if self.running:
             raise ValueError('已有任务正在运行')
         refs,candidates=validate_folders(reference,source,output)
+        excluded=validate_excluded_folder(excluded or self.root/'manual_excluded',reference,source,output)
+        candidates,skipped=pending_videos(candidates,ReviewStore(self.runtime/'review_decisions.json',target_identity(refs)))
+        if not candidates:
+            raise ValueError('所有待筛选视频都已手动排除，本轮无需重新分析')
         python=self.root/'.venv/Scripts/python.exe'
         backend=self.root/'src/filter_videos.py'
         if not python.exists() or not backend.exists():
@@ -95,7 +102,7 @@ class DesktopController:
                     '--input-dir',str(Path(source).resolve()),'--output-dir',str(output),
                     '--report-dir',str(report),'--stop-file',str(self.stop_file),
                     '--decisions-file',str(self.runtime/'review_decisions.json'),'--events',
-                    '--threshold',str(threshold)]
+                    '--threshold',str(threshold),'--excluded-dir',str(excluded)]
                 if refresh:args.append('--refresh')
                 if limit:args.extend(['--limit',str(limit)])
                 if no_latest:args.append('--no-latest')
@@ -107,8 +114,10 @@ class DesktopController:
         except Timeout:
             raise ValueError('另一项筛选正在运行，请先停止或等待完成') from None
         self.report,self.output=report,output
+        self.excluded=excluded
         self.summary={'input_dir':str(Path(source).resolve()),'reference_dir':str(Path(reference).resolve()),
-            'output_dir':str(output),'target_id':target_identity(refs),'total':min(limit,len(candidates)) if limit else len(candidates)}
+            'output_dir':str(output),'excluded_dir':str(excluded),'skipped_excluded':skipped,
+            'target_id':target_identity(refs),'total':min(limit,len(candidates)) if limit else len(candidates)}
         self.store=ReviewStore(self.runtime/'review_decisions.json',self.summary['target_id'])
         self.rows=[]
         self.thread=threading.Thread(target=self._read,daemon=True)
@@ -150,15 +159,21 @@ class DesktopController:
             with FileLock(self.runtime/'filter.lock',timeout=0):
                 for row in rows:
                     source=Path(row['source_path'])
+                    excluded=validate_excluded_folder(self.excluded or self.root/'manual_excluded',
+                        self.summary.get('reference_dir',self.root/'input/reference_video'),
+                        self.summary.get('input_dir',self.root/'input/waiting_for_filter_videos'),self.output)
                     if decision=='keep':
                         copy_exact(source,self.output/row['file'])
+                        remove_from_output(source,excluded/row['file'],self.report/'restored_from_excluded')
                         status,copied='manual_kept',True
                     elif decision=='exclude':
+                        copy_exact(source,excluded/row['file'])
                         remove_from_output(source,self.output/row['file'],self.report/'removed_from_output')
                         status,copied='manual_excluded',False
                     else:raise ValueError('Unknown review action')
                     self.store.set(source,decision)
                     patch={'status':status,'copied':copied,'manual_decision':decision}
+                    self.summary['excluded_dir']=str(excluded)
                     changes[row['file']]=patch
                     row.update(patch)
                     completed.append(row['file'])

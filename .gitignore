@@ -2,6 +2,7 @@
 models/
 input/
 output/
+manual_excluded/
 reports/
 cache/
 __pycache__/

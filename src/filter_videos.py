@@ -218,7 +218,7 @@ def copy_original(source, destination):
     temporary.replace(destination)
 
 
-from app_common import persist_report as write_reports
+from app_common import persist_report as write_reports,pending_videos,validate_excluded_folder
 
 
 def parse_args():
@@ -237,6 +237,7 @@ def parse_args():
     parser.add_argument('--report-dir',type=Path)
     parser.add_argument('--stop-file',type=Path)
     parser.add_argument('--decisions-file',type=Path)
+    parser.add_argument('--excluded-dir',type=Path,default=ROOT/'manual_excluded')
     parser.add_argument('--events',action='store_true')
     parser.add_argument('--no-latest',action='store_true')
     args = parser.parse_args()
@@ -249,6 +250,7 @@ def run(args):
     check_stop(args.stop_file)
     torch.set_num_threads(4)
     refs,candidates=validate_folders(args.reference_dir,args.input_dir,args.output_dir)
+    excluded=validate_excluded_folder(args.excluded_dir,args.reference_dir,args.input_dir,args.output_dir)
     output=args.output_dir.resolve()
     output.mkdir(parents=True,exist_ok=True)
     report=args.report_dir
@@ -259,10 +261,11 @@ def run(args):
     (report/'evidence').mkdir()
     from app_common import target_identity
     target_id=target_identity(refs)
-    decisions=ReviewStore(args.decisions_file,target_id) if args.decisions_file else None
+    decisions=ReviewStore(args.decisions_file or ROOT/'runtime/review_decisions.json',target_id)
+    candidates,skipped_excluded=pending_videos(candidates,decisions)
     if args.limit:
         candidates=candidates[:args.limit]
-    emit(args,'started',report=str(report.resolve()),total=len(candidates),output=str(output))
+    emit(args,'started',report=str(report.resolve()),total=len(candidates),output=str(output),skipped_excluded=skipped_excluded)
     emit(args,'phase',message='正在加载人物检测与衣着匹配模型')
     pipeline = Pipeline(args)
     check_stop(args.stop_file)
@@ -299,6 +302,7 @@ def run(args):
                'reference_crops':len(reference['embeddings']), 'report':str(report),
                'reference_checks':reference_checks,'reference_dir':str(args.reference_dir.resolve()),
                'input_dir':str(args.input_dir.resolve()),'output_dir':str(output),'target_id':target_id,
+               'excluded_dir':str(excluded),'skipped_excluded':skipped_excluded,
                'processed':0,'copied':0,'errors':0,'total':len(candidates),'cancelled':False}
     write_reports(rows,report,summary)
     for n, path in enumerate(candidates, 1):
