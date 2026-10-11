@@ -1,0 +1,6 @@
+ultralytics==8.4.63
+opencv-python>=4.12,<5
+numpy>=2,<3
+Pillow>=12,<13
+lap>=0.5.12
+filelock>=3.20,<4

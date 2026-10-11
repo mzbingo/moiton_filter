@@ -1,0 +1,12 @@
+.venv/
+models/
+input/
+output/
+reports/
+cache/
+__pycache__/
+*.pyc
+runtime/
+build/
+*.exe
+*.spec
