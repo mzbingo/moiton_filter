@@ -1,12 +1,14 @@
-"""Exercise actual Tk buttons against disposable files, without changing real videos."""
+"""Actual Qt controls on disposable files; no production videos changed."""
 import sys
 import tempfile
-import tkinter as tk
 from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'src'))
+from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QPoint
 from app_common import persist_report,pending_videos
-from desktop_app import App
-
+from modern_app import ModernWindow
+application=QApplication.instance() or QApplication(sys.argv)
+application.setStyle('Fusion')
 with tempfile.TemporaryDirectory() as directory:
     root=Path(directory);inputs=root/'input/waiting_for_filter_videos';inputs.mkdir(parents=True)
     refs=root/'input/reference_video';refs.mkdir();(refs/'ref.ts').write_bytes(b'reference')
@@ -18,24 +20,33 @@ with tempfile.TemporaryDirectory() as directory:
     summary=dict(input_dir=str(inputs),reference_dir=str(refs),output_dir=str(root/'output'),target_id='target')
     persist_report([row],report,summary)
     (root/'reports/latest.txt').write_text(str(report),encoding='utf-8')
-    window=tk.Tk();app=App(window,root);window.update()
-    window.minsize(1000,640)
-    window.geometry('1100x700');window.update()
-    for button in (app.keep_button,app.exclude_button):
-        assert button.winfo_ismapped()
-        assert button.winfo_rooty()+button.winfo_height()<window.winfo_rooty()+window.winfo_height()
-        assert button.winfo_rooty()<app.table.winfo_rooty()
-    app.filter('待确认');window.update()
-    app.table.selection_set(app.table.get_children()[0]);window.update()
-    assert str(app.keep_button['state'])!='disabled'
-    app.keep_button.invoke();window.update()
+    window=ModernWindow(root);window.resize(1100,700);window.show();application.processEvents()
+    for control in (window.keep_button,window.exclude_button):
+        assert control.isVisible()
+        bottom=control.mapTo(window,QPoint(control.width(),control.height()))
+        assert bottom.x()<window.width() and bottom.y()<window.height()
+        assert control.mapTo(window,QPoint(0,0)).y()<window.table.mapTo(window,QPoint(0,0)).y()
+    for index in range(4):
+        window.navigate(index);application.processEvents();assert window.stack.currentIndex()==index
+    window.navigate(0)
+    pending=list(window.filters)[1];kept=list(window.filters)[0];excluded=list(window.filters)[4]
+    window.set_filter(pending);application.processEvents();assert window.table.rowCount()==1
+    window.table.selectRow(0);application.processEvents();assert window.keep_button.isEnabled()
+    window.keep_button.click();application.processEvents()
     assert (root/'output/candidate.ts').read_bytes()==b'original'
-    app.filter('已保留');window.update()
-    app.table.selection_set(app.table.get_children()[0]);window.update()
-    app.exclude_button.invoke();window.update()
+    window.set_filter(kept);window.table.selectRow(0);application.processEvents()
+    window.exclude_button.click();application.processEvents()
     assert (root/'manual_excluded/candidate.ts').read_bytes()==b'original'
     assert not (root/'output/candidate.ts').exists()
-    assert pending_videos([source],app.controller.store)==([],1)
+    assert pending_videos([source],window.controller.store)==([],1)
+    window.set_filter(excluded);assert window.table.rowCount()==1
+    window.table.selectRow(0);window.keep_button.click();application.processEvents()
+    assert (root/'output/candidate.ts').read_bytes()==b'original'
+    assert not (root/'manual_excluded/candidate.ts').exists()
+    window.search.setText('not-found');assert window.table.rowCount()==0 and window.empty.isVisible()
+    window.search.clear();window.set_filter(kept);assert window.table.rowCount()==1
+    window.set_running(True);assert not window.keep_button.isEnabled() and not window.start_button.isEnabled()
+    window.set_running(False);assert window.keep_button.isEnabled()
     assert source.read_bytes()==b'original'
-    app.close()
-print('GUI review buttons, exclusion folder and rescan skipping: PASS')
+    window.close();application.processEvents()
+print('Modern GUI small window, navigation, review, exclusion, restore, search, task state: PASS')
