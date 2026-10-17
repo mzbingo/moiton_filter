@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'src'))
-from filter_videos import copy_original
+from app_common import copy_exact
 from clothing import verified_match, garment_features
 
 
@@ -59,11 +59,11 @@ class ClothingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             src,dst=Path(directory)/'input.ts',Path(directory)/'output.ts'
             src.write_bytes(b'original\x00\xff')
-            copy_original(src,dst)
+            copy_exact(src,dst)
             self.assertEqual(src.read_bytes(),dst.read_bytes())
             dst.write_bytes(b'different')
-            with self.assertRaises(RuntimeError):
-                copy_original(src,dst)
+            with self.assertRaises(ValueError):
+                copy_exact(src,dst)
 
 
 if __name__=='__main__':

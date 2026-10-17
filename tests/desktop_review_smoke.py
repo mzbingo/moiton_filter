@@ -1,6 +1,7 @@
 """Actual Qt controls on disposable files; no production videos changed."""
 import sys
 import tempfile
+import time
 from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'src'))
 from PySide6.QtWidgets import QApplication
@@ -9,6 +10,14 @@ from app_common import persist_report,pending_videos
 from modern_app import ModernWindow
 application=QApplication.instance() or QApplication(sys.argv)
 application.setStyle('Fusion')
+def wait_until(predicate,timeout=5):
+    deadline=time.monotonic()+timeout
+    while time.monotonic()<deadline:
+        application.processEvents()
+        if predicate():return
+        time.sleep(.01)
+    raise AssertionError('Qt action timed out')
+
 with tempfile.TemporaryDirectory() as directory:
     root=Path(directory);inputs=root/'input/waiting_for_filter_videos';inputs.mkdir(parents=True)
     refs=root/'input/reference_video';refs.mkdir();(refs/'ref.ts').write_bytes(b'reference')
@@ -32,18 +41,19 @@ with tempfile.TemporaryDirectory() as directory:
     pending=list(window.filters)[1];kept=list(window.filters)[0];excluded=list(window.filters)[4]
     window.set_filter(pending);application.processEvents();assert window.table.rowCount()==1
     window.table.selectRow(0);application.processEvents();assert window.keep_button.isEnabled()
-    window.keep_button.click();application.processEvents()
+    window.keep_button.click();wait_until(lambda:not window.review_busy)
     assert (root/'output/candidate.ts').read_bytes()==b'original'
     window.set_filter(kept);window.table.selectRow(0);application.processEvents()
-    window.exclude_button.click();application.processEvents()
+    window.exclude_button.click();wait_until(lambda:not window.review_busy)
     assert (root/'manual_excluded/candidate.ts').read_bytes()==b'original'
     assert not (root/'output/candidate.ts').exists()
     assert pending_videos([source],window.controller.store)==([],1)
     window.set_filter(excluded);assert window.table.rowCount()==1
-    window.table.selectRow(0);window.keep_button.click();application.processEvents()
+    window.table.selectRow(0);window.keep_button.click();wait_until(lambda:not window.review_busy)
     assert (root/'output/candidate.ts').read_bytes()==b'original'
     assert not (root/'manual_excluded/candidate.ts').exists()
-    window.search.setText('not-found');assert window.table.rowCount()==0 and window.empty.isVisible()
+    window.search.setText('not-found');wait_until(lambda:window.table.rowCount()==0)
+    assert window.empty.isVisible()
     window.search.clear();window.set_filter(kept);assert window.table.rowCount()==1
     window.set_running(True);assert not window.keep_button.isEnabled() and not window.start_button.isEnabled()
     window.set_running(False);assert window.keep_button.isEnabled()

@@ -4,13 +4,15 @@ import json
 import os
 import queue
 import sys
+import threading
 from pathlib import Path
-from PySide6.QtCore import Qt,QTimer,QSize
+from PySide6.QtCore import Qt,QTimer,QSize,QRectF
 from PySide6.QtGui import QColor,QFont,QIcon,QImage,QPainter,QPen,QPixmap
 from PySide6.QtWidgets import (QApplication,QMainWindow,QWidget,QFrame,QLabel,QPushButton,
     QVBoxLayout,QHBoxLayout,QGridLayout,QStackedWidget,QLineEdit,QComboBox,QCheckBox,
     QProgressBar,QTableWidget,QTableWidgetItem,QHeaderView,QAbstractItemView,QSplitter,
-    QSlider,QFileDialog,QMessageBox,QPlainTextEdit,QScrollArea,QDialog,QListWidget,QSizePolicy)
+    QSlider,QFileDialog,QMessageBox,QPlainTextEdit,QScrollArea,QDialog,QListWidget,QSizePolicy,
+    QStyledItemDelegate,QStyleOptionViewItem)
 from app_common import app_root,save_json,video_files
 from desktop_controller import DesktopController
 from video_preview import VideoPreview,WIDTH,HEIGHT
@@ -137,6 +139,24 @@ class PreviewLabel(QLabel):
         super().resizeEvent(event);self.fit()
 
 
+class StatusDelegate(QStyledItemDelegate):
+    """Paint status badges without creating a QWidget for every result row."""
+    def paint(self,painter,option,index):
+        background_option=QStyleOptionViewItem(option)
+        self.initStyleOption(background_option,index)
+        background_option.text=''
+        super().paint(painter,background_option,index)
+        status=index.data(Qt.ItemDataRole.UserRole)
+        text=LABELS.get(status,status or '')
+        background,foreground=COLORS.get(status,('#f1f3f7','#7c8799'))
+        painter.save();painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        font=painter.font();font.setPixelSize(11);painter.setFont(font)
+        width=painter.fontMetrics().horizontalAdvance(text)+14
+        rect=QRectF(option.rect.x()+7,option.rect.center().y()-13,width,26)
+        painter.setPen(Qt.PenStyle.NoPen);painter.setBrush(QColor(background));painter.drawRoundedRect(rect,5,5)
+        painter.setPen(QColor(foreground));painter.drawText(rect,Qt.AlignmentFlag.AlignCenter,text);painter.restore()
+
+
 class ModernWindow(QMainWindow):
     def __init__(self,root=None):
         super().__init__()
@@ -144,6 +164,11 @@ class ModernWindow(QMainWindow):
         self.playing=False;self.closing=False;self.preview_source=None;self.selected_key=None;self.backup=None
         self.filter_name='已保留';self.visible_rows=[];self.controls=[]
         self.thumbnail_cache={}
+        self.review_busy=False;self.review_events=queue.Queue()
+        self.render_timer=QTimer(self);self.render_timer.setSingleShot(True)
+        self.render_timer.timeout.connect(self.render_rows)
+        self.search_timer=QTimer(self);self.search_timer.setSingleShot(True)
+        self.search_timer.timeout.connect(self.render_rows)
         try:self.settings=json.loads((self.root/'runtime/gui_settings.json').read_text(encoding='utf-8'))
         except (OSError,ValueError):self.settings={}
         self.setWindowTitle('人物视频筛选 · 复核工作台');self.resize(1440,920);self.setMinimumSize(1060,700)
@@ -205,7 +230,7 @@ class ModernWindow(QMainWindow):
             tabs.addWidget(tab);self.filters[name]=tab
         tabs.addStretch();leftbox.addLayout(tabs)
         toolbar=QHBoxLayout();self.search=QLineEdit();self.search.setPlaceholderText('搜索视频文件名…')
-        self.search.textChanged.connect(self.render_rows);toolbar.addWidget(self.search,1)
+        self.search.textChanged.connect(lambda _:self.search_timer.start(160));toolbar.addWidget(self.search,1)
         leftbox.addLayout(toolbar)
         actions=QHBoxLayout();self.keep_button=button('确认保留选中',lambda:self.review('keep'),'primary')
         self.exclude_button=button('确认排除选中',lambda:self.review('exclude'),'danger')
@@ -218,6 +243,7 @@ class ModernWindow(QMainWindow):
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers);self.table.setShowGrid(False)
+        self.table.setItemDelegateForColumn(1,StatusDelegate(self.table))
         self.table.horizontalHeader().setSectionResizeMode(0,QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(1,QHeaderView.ResizeMode.Fixed);self.table.setColumnWidth(1,108)
         self.table.horizontalHeader().setSectionResizeMode(2,QHeaderView.ResizeMode.Fixed);self.table.setColumnWidth(2,85)
@@ -306,13 +332,14 @@ class ModernWindow(QMainWindow):
         save_json(self.root/'runtime/gui_settings.json',{**{k:v.text() for k,v in self.paths.items()},'mode':self.mode.currentText(),'archive':self.archive.isChecked()})
 
     def start(self):
+        if self.review_busy or self.controller.running:return
         try:
             threshold={'标准（推荐）':.72,'更严格':.78,'更宽松（多选）':.68}[self.mode.currentText()]
+            self.save_settings()
             self.controller.start(*(self.paths[k].text() for k in ('reference','source','output')),threshold=threshold,
                 archive=self.archive.isChecked(),refresh=self.refresh.isChecked(),excluded=self.paths['excluded'].text())
-            self.save_settings()
         except Exception as exc:self.error('无法开始筛选',exc);self.navigate(1);return
-        self.player.stop();self.playing=False;self.selected_key=None;self.preview.show_image(None)
+        self.clear_preview();self.thumbnail_cache.clear()
         self.set_running(True);self.set_filter('全部');self.navigate(0)
         self.progress.setRange(0,max(1,self.controller.summary['total']));self.progress.setValue(0)
         self.status.setText('正在准备模型与参考人物…')
@@ -321,16 +348,20 @@ class ModernWindow(QMainWindow):
         self.controller.stop();self.stop_button.setEnabled(False);self.status.setText('正在停止并保存已完成的结果…')
 
     def set_running(self,running):
-        self.start_button.setEnabled(not running);self.stop_button.setEnabled(running)
-        self.keep_button.setEnabled(not running);self.exclude_button.setEnabled(not running)
-        self.review_hint.setText('筛选完成或停止后可手动确认' if running else '先选择视频，支持 Ctrl / Shift 多选')
-        for control in self.controls:control.setEnabled(not running)
+        busy=running or self.review_busy
+        self.start_button.setEnabled(not busy);self.stop_button.setEnabled(running)
+        self.keep_button.setEnabled(not busy);self.exclude_button.setEnabled(not busy)
+        self.review_hint.setText('正在复制视频并保存复核决定…' if self.review_busy else '筛选完成或停止后可手动确认' if running else '先选择视频，支持 Ctrl / Shift 多选')
+        for control in self.controls:control.setEnabled(not busy)
 
     def set_filter(self,name):
         self.filter_name=name;self.render_rows()
 
     def render_rows(self,*_):
+        if self.review_busy:return
+        self.render_timer.stop();self.search_timer.stop()
         selected={r['file'] for r in self.selected_rows()}
+        scroll=self.table.verticalScrollBar().value()
         rows=self.controller.rows;search=self.search.text().strip().casefold()
         counts={'已保留':sum(r['copied'] for r in rows),'待确认':sum(r['status']=='review' for r in rows),'全部':len(rows),
             '未匹配':sum(r['status'] in ('no_match','no_person') for r in rows),'已排除':sum(r['status']=='manual_excluded' for r in rows),'异常':sum(r['status']=='error' for r in rows)}
@@ -340,7 +371,8 @@ class ModernWindow(QMainWindow):
             return (self.filter_name=='全部' or self.filter_name=='已保留' and row['copied'] or self.filter_name=='待确认' and row['status']=='review' or
                 self.filter_name=='未匹配' and row['status'] in ('no_match','no_person') or self.filter_name=='已排除' and row['status']=='manual_excluded' or self.filter_name=='异常' and row['status']=='error')
         self.visible_rows=[r for r in sorted(rows,key=lambda r:(not r['copied'],-r['score'])) if include(r) and (not search or search in r['file'].casefold())]
-        self.table.blockSignals(True);self.table.clearContents();self.table.setRowCount(len(self.visible_rows))
+        self.table.blockSignals(True);self.table.setUpdatesEnabled(False)
+        self.table.clearContents();self.table.setRowCount(len(self.visible_rows))
         from PySide6.QtCore import QItemSelectionModel
         for index,row in enumerate(self.visible_rows):
             item=QTableWidgetItem(row['file']);item.setToolTip(row['file']);self.table.setItem(index,0,item)
@@ -351,17 +383,15 @@ class ModernWindow(QMainWindow):
                     self.thumbnail_cache[path]=QIcon(pixmap.scaled(35,44,Qt.AspectRatioMode.KeepAspectRatio,Qt.TransformationMode.SmoothTransformation))
                 item.setIcon(self.thumbnail_cache[path])
             status=QTableWidgetItem('');status.setToolTip(LABELS.get(row['status'],row['status']))
+            status.setData(Qt.ItemDataRole.UserRole,row['status'])
             self.table.setItem(index,1,status);self.table.setItem(index,2,QTableWidgetItem(f'{row["time_seconds"]:.1f} 秒'))
-            cell=QWidget();cell.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-            cellbox=QHBoxLayout(cell);cellbox.setContentsMargins(7,0,7,0);cellbox.setAlignment(Qt.AlignmentFlag.AlignLeft|Qt.AlignmentFlag.AlignVCenter)
-            pill=label(LABELS.get(row['status'],row['status']));background,foreground=COLORS.get(row['status'],('#f1f3f7','#7c8799'))
-            pill.setStyleSheet(f'background:{background};color:{foreground};border-radius:5px;padding:4px 7px;font-size:11px;')
-            pill.setFixedHeight(26)
-            cellbox.addWidget(pill);self.table.setCellWidget(index,1,cell)
             if row['file'] in selected:self.table.selectionModel().select(self.table.model().index(index,0),QItemSelectionModel.SelectionFlag.Select|QItemSelectionModel.SelectionFlag.Rows)
-        self.table.blockSignals(False);self.empty.setVisible(not self.visible_rows)
+        self.table.verticalScrollBar().setValue(scroll)
+        self.table.setUpdatesEnabled(True);self.table.blockSignals(False);self.empty.setVisible(not self.visible_rows)
         self.empty.setText('这个分类还没有视频。试试其他分类，或开始新一轮筛选。')
         self.selection_count.setText(f'{len(self.selected_rows())} 项选中')
+        if self.selected_rows():self.selected()
+        elif self.selected_key is not None:self.clear_preview()
 
     def selected_rows(self):
         return [self.visible_rows[i.row()] for i in self.table.selectionModel().selectedRows() if i.row()<len(self.visible_rows)]
@@ -374,6 +404,12 @@ class ModernWindow(QMainWindow):
             evidence=self.controller.report/row['evidence'] if row.get('evidence') else None
             self.show_video(row['source_path'],evidence,max(0,row['time_seconds']-.6));self.selected_key=key
         self.detail.setText(f'{LABELS.get(row["status"],row["status"])}\n上装 {row["upper_color"]:.2f}   ·   下装 {row["lower_color"]:.2f}\n支持 {row["support_frames"]} 帧'+(f'\n{row["error"]}' if row.get('error') else ''))
+
+    def clear_preview(self):
+        self.player.stop();self.playing=False;self.selected_key=None;self.preview_source=None
+        self.preview.show_image(None);self.preview_title.setText('尚未选择视频')
+        self.play_button.setText('播放完整视频');self.slider.setRange(0,60000);self.slider.setValue(0)
+        self.time_label.setText('00:00 / --:--');self.detail.setText('选择视频，查看匹配线索。')
 
     def show_video(self,path,evidence=None,position=0):
         self.player.stop();self.playing=False;self.selected_key=None;self.preview_source=Path(path)
@@ -397,17 +433,23 @@ class ModernWindow(QMainWindow):
         value=max(0,int(value));return f'{value//60:02d}:{value%60:02d}'
 
     def review(self,decision):
+        if self.review_busy or self.controller.running:return
         rows=self.selected_rows()
         if not rows:QMessageBox.information(self,'选择视频','先在视频列表中选择要确认的片段。支持 Ctrl / Shift 多选。');return
         try:
+            self.save_settings()
             self.player.stop();self.playing=False;self.play_button.setText('播放完整视频')
             self.controller.excluded=Path(self.paths['excluded'].text()).resolve()
-            done=self.controller.review(rows,decision);self.save_settings()
-            self.status.setText(f'已{ "保留" if decision=="keep" else "排除" } {len(done)} 个视频 · 复核决定已保存')
-            self.render_rows();self.update_counts()
-        except Exception as exc:self.render_rows();self.error('操作未完成',exc)
+        except Exception as exc:self.error('操作未完成',exc);return
+        self.review_busy=True;self.set_running(False)
+        self.status.setText(f'正在{ "保留" if decision=="keep" else "排除" } {len(rows)} 个视频…')
+        def work():
+            try:self.review_events.put({'done':self.controller.review(rows,decision),'decision':decision})
+            except Exception as exc:self.review_events.put({'error':str(exc)})
+        threading.Thread(target=work,daemon=True).start()
 
     def loaded(self,update_paths=False):
+        self.clear_preview();self.thumbnail_cache.clear()
         summary=self.controller.summary
         if update_paths:
             for key,field in [('reference','reference_dir'),('source','input_dir'),('output','output_dir'),('excluded','excluded_dir')]:
@@ -419,6 +461,7 @@ class ModernWindow(QMainWindow):
         self.update_counts()
 
     def choose_report(self):
+        if self.review_busy:QMessageBox.information(self,'正在保存复核','请等待复核决定保存完成，再打开历史结果。');return
         if self.controller.running:QMessageBox.information(self,'任务进行中','请先停止任务，再打开历史结果。');return
         path,_=QFileDialog.getOpenFileName(self,'选择历史报告的 summary.json',str(self.root/'reports'),'筛选结果 (summary.json)')
         if path:
@@ -446,28 +489,49 @@ class ModernWindow(QMainWindow):
             if path and Path(path).exists():self.open_path(path);return
         QMessageBox.information(self,'暂无备份','归档旧输出或排除已保留视频后，将生成备份。')
 
+    def reference_images(self,path):
+        if not self.controller.report:return []
+        references=self.controller.summary.get('references',[])
+        for reference in references:
+            source=reference.get('source_path')
+            if source and Path(source).resolve()==Path(path).resolve():
+                return [self.controller.report/name for name in reference.get('evidence',[])
+                    if (self.controller.report/name).is_file()]
+        # Modern reports identify each reference by its full source path. Never
+        # borrow another video's thumbnails merely because the stems coincide.
+        if any('source_path' in reference or 'evidence' in reference for reference in references):return []
+        return sorted((self.controller.report/'evidence').glob(f'ref_{Path(path).stem}_*.jpg'))
+
     def show_references(self):
-        paths=video_files(self.paths['reference'].text())
-        if not paths:QMessageBox.information(self,'没有参考视频','请在任务设置中选择包含目标人物的参考目录。');return
+        # Task settings may already describe the next target. While reviewing a
+        # report, its reference videos must stay paired with its result/evidence.
+        current_reference=self.controller.summary.get('reference_dir') if self.controller.report else None
+        folder=Path(current_reference or self.paths['reference'].text())
+        paths=video_files(folder)
+        if not paths:
+            message=f'当前报告的参考目录中没有视频：\n{folder}' if current_reference else '请在任务设置中选择包含目标人物的参考目录。'
+            QMessageBox.information(self,'没有参考视频',message);return
         dialog=QDialog(self);dialog.setWindowTitle('参考人物');dialog.resize(560,360);box=QVBoxLayout(dialog)
         box.addWidget(label('选择参考视频，检查本轮目标人物','section'));listing=QListWidget();listing.addItems([p.name for p in paths]);listing.setCurrentRow(0);box.addWidget(listing)
         def show():
             index=listing.currentRow()
             if index<0:return
-            path=paths[index];images=sorted((self.controller.report/'evidence').glob(f'ref_{path.stem}_*.jpg')) if self.controller.report else []
+            path=paths[index];images=self.reference_images(path)
             self.show_video(path,images[len(images)//2] if images else None);self.detail.setText('参考视频 · 本轮要寻找的目标人物');dialog.accept();self.navigate(0)
         box.addWidget(button('预览选中参考',show,'primary'));listing.itemDoubleClicked.connect(lambda _:show());dialog.exec()
 
     def error(self,title,exception):QMessageBox.warning(self,title,str(exception))
 
     def poll(self):
-        dirty=False
+        dirty=False;finished=False
         for _ in range(100):
             try:event=self.controller.events.get_nowait()
             except queue.Empty:break
             kind=event['type']
             if kind=='log':self.logs.appendPlainText(event['message'])
-            elif kind=='started':self.progress.setRange(0,max(1,event['total']))
+            elif kind=='started':
+                self.progress.setRange(0,max(1,event['total']))
+                self.report_label.setText(str(event.get('report') or self.controller.report))
             elif kind=='phase' and not self.closing:self.status.setText(event['message'])
             elif kind=='device':self.device.setText(event['name']+' · 本机处理')
             elif kind=='backup':self.backup=Path(event['path']);self.logs.appendPlainText(f'旧输出已归档：{self.backup}')
@@ -479,12 +543,28 @@ class ModernWindow(QMainWindow):
             elif kind=='exit':
                 self.set_running(False)
                 if self.controller.report and (self.controller.report/'results.csv').exists():
-                    try:self.controller.load(self.controller.report)
+                    try:
+                        self.controller.load(self.controller.report)
+                        self.report_label.setText(str(self.controller.report))
                     except Exception as exc:self.logs.appendPlainText(str(exc))
-                if event['code']:self.status.setText('任务未完全完成，请检查异常结果和运行日志')
-                dirty=True;self.update_counts()
+                if self.controller.summary.get('status')=='failed':
+                    self.status.setText('任务失败：'+str(self.controller.summary.get('fatal_error') or '请检查运行日志'))
+                elif event['code']:self.status.setText('任务未完全完成，请检查异常结果和运行日志')
+                dirty=True;finished=True;self.update_counts()
                 if self.closing:self.close();return
-        if dirty:self.render_rows()
+        if finished:self.render_rows()
+        elif dirty and not self.render_timer.isActive():self.render_timer.start(120)
+        try:
+            result=self.review_events.get_nowait()
+        except queue.Empty:pass
+        else:
+            self.review_busy=False;self.set_running(self.controller.running)
+            self.render_rows();self.update_counts()
+            if result.get('error'):
+                self.status.setText('复核未全部完成，已完成的决定已保存')
+                if not self.closing:self.error('操作未完成',result['error'])
+            else:self.status.setText(f'已{ "保留" if result["decision"]=="keep" else "排除" } {len(result["done"])} 个视频 · 复核决定已保存')
+            if self.closing:self.close();return
         for _ in range(20):
             try:event=self.player.events.get_nowait()
             except queue.Empty:break
@@ -499,19 +579,22 @@ class ModernWindow(QMainWindow):
             if generation==self.player.generation:
                 image=QImage(data,WIDTH,HEIGHT,WIDTH*3,QImage.Format.Format_RGB888).copy()
                 self.preview.show_image(QPixmap.fromImage(image))
-                if not self.slider.isSliderDown():self.slider.setValue(int(position*1000))
-                self.time_label.setText(f'{self.format_time(position)} / {self.format_time(self.player.duration)}')
+                if self.playing:
+                    if not self.slider.isSliderDown():self.slider.setValue(int(position*1000))
+                    self.time_label.setText(f'{self.format_time(position)} / {self.format_time(self.player.duration)}')
         except queue.Empty:pass
 
     def closeEvent(self,event):
         self.player.stop()
-        if self.controller.running:
+        if self.review_busy:
+            self.closing=True;self.status.setText('正在保存复核决定，完成后自动关闭…');event.ignore()
+        elif self.controller.running:
             self.closing=True;self.controller.stop();self.stop_button.setEnabled(False)
             self.status.setText('正在保存结果，任务停止后自动关闭…');event.ignore()
         else:
             try:self.save_settings()
             except OSError:pass
-            self.timer.stop();event.accept()
+            self.timer.stop();self.render_timer.stop();self.search_timer.stop();event.accept()
 
 
 def main():

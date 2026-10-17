@@ -1,6 +1,7 @@
 """Shared desktop/worker operations. Standard library only; no model imports."""
 import csv
 import hashlib
+import html
 import json
 import os
 import shutil
@@ -53,6 +54,10 @@ class ReviewStore:
     def get(self,source):
         return self._load().get(self.target_id,{}).get(source_identity(source),{}).get('decision')
 
+    def snapshot(self):
+        """Read once per run; the worker lock prevents concurrent review writes."""
+        return {key:value.get('decision') for key,value in self._load().get(self.target_id,{}).items()}
+
     def set(self,source,decision):
         if decision not in {'keep','exclude'}:
             raise ValueError('Invalid review decision')
@@ -70,6 +75,27 @@ def pending_videos(candidates,store):
     excluded=store.excluded_sources() if store else set()
     pending=[p for p in candidates if source_identity(p) not in excluded]
     return pending,len(candidates)-len(pending)
+
+
+def archive_output(output,backup):
+    """Move old output only after the worker is ready; undo a partial move on failure."""
+    output,backup=Path(output).resolve(),Path(backup).resolve()
+    if output==backup or output.is_relative_to(backup) or backup.is_relative_to(output):
+        raise ValueError('备份目录必须与输出目录分开')
+    previous=[p for p in output.iterdir() if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS]
+    if not previous:return 0
+    backup.mkdir(parents=True,exist_ok=False)
+    moved=[]
+    try:
+        for source in previous:
+            target=backup/source.name
+            shutil.move(str(source),str(target))
+            moved.append((source,target))
+    except Exception:
+        for source,target in reversed(moved):
+            if not source.exists():shutil.move(str(target),str(source))
+        raise
+    return len(moved)
 
 
 def validate_excluded_folder(excluded,*folders):
@@ -100,12 +126,18 @@ def file_digest(path):
         return hashlib.file_digest(stream,'sha256').hexdigest()
 
 
+def validate_review_copy(source,copy):
+    """Check a review counterpart before creating or moving any output."""
+    source,copy=Path(source),Path(copy)
+    if copy.exists() and (source.resolve()==copy.resolve() or file_digest(source)!=file_digest(copy)):
+        raise ValueError('输出或排除副本与原视频不一致，未移动，请手动检查')
+
+
 def remove_from_output(source,output,backup):
     source,output,backup=Path(source),Path(output),Path(backup)
     if not output.exists():
         return None
-    if source.resolve()==output.resolve() or file_digest(source)!=file_digest(output):
-        raise ValueError('输出文件与原视频不一致，未移动，请手动检查')
+    validate_review_copy(source,output)
     backup.mkdir(parents=True,exist_ok=True)
     destination=backup/output.name
     if destination.exists():
@@ -135,15 +167,19 @@ def load_report(report):
     summary=json.loads((report/'summary.json').read_text(encoding='utf-8'))
     with (report/'results.csv').open(encoding='utf-8-sig',newline='') as stream:
         rows=list(csv.DictReader(stream))
+    from run_report import recover_rows
+    recovered=recover_rows(report)
+    if recovered is not None and len(recovered)>len(rows):
+        rows=recovered
+        summary['recovered_from_journal']=True
     for row in rows:
         row['copied']=str(row.get('copied','')).lower()=='true'
         for key in ('score','upper_color','lower_color','time_seconds'):
             row[key]=float(row.get(key) or 0)
         row['support_frames']=int(row.get('support_frames') or 0)
+    summary.update(processed=len(rows),copied=sum(row['copied'] for row in rows),errors=sum(row['status']=='error' for row in rows))
     return summary,rows
 
-
-import html
 
 def persist_report(rows, report, summary):
     keys = ['file','status','score','reid_similarity','color_similarity','upper_color','lower_color','support_frames','time_seconds','track_id','detections','copied','evidence','error','source_path','manual_decision']
@@ -161,4 +197,6 @@ def persist_report(rows, report, summary):
         else:
             video_url=Path(row.get('source_path') or app_root()/'input/waiting_for_filter_videos'/row['file']).resolve().as_uri()
         cards.append(f'<article>{image}<b>{html.escape(row["file"])}</b><p>{row["status"]} | ReID {row["score"]:.3f} | {row["time_seconds"]:.2f}s</p><p>上装 {row["upper_color"]:.2f} / 下装 {row["lower_color"]:.2f} / 支持帧 {row["support_frames"]}</p><a href="{video_url}">原视频文件</a><p>{html.escape(row["error"])}</p></article>')
-    (report/'review.html').write_text('<!doctype html><meta charset="utf-8"><title>人物筛选复核</title><style>body{font-family:system-ui;background:#eee;padding:20px}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px}article{background:white;padding:12px;overflow-wrap:anywhere}img{height:240px;max-width:100%;object-fit:contain;display:block}</style><h1>人物筛选复核</h1><p>match 和 manual_kept 为保留结果；review 需要人工确认；manual_excluded 为手动排除；error 为处理错误。评分不是身份概率。</p><p><a href="reference_profile.json">参考人物颜色特征</a> · <a href="reference_checks.json">参考一致性检查</a></p><div class="grid">'+''.join(cards)+'</div>', encoding='utf-8')
+    temporary=report/'review.html.tmp'
+    temporary.write_text('<!doctype html><meta charset="utf-8"><title>人物筛选复核</title><style>body{font-family:system-ui;background:#eee;padding:20px}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px}article{background:white;padding:12px;overflow-wrap:anywhere}img{height:240px;max-width:100%;object-fit:contain;display:block}</style><h1>人物筛选复核</h1><p>match 和 manual_kept 为保留结果；review 需要人工确认；manual_excluded 为手动排除；error 为处理错误。评分不是身份概率。</p><p><a href="reference_profile.json">参考人物颜色特征</a> · <a href="reference_checks.json">参考一致性检查</a></p><div class="grid">'+''.join(cards)+'</div>', encoding='utf-8')
+    temporary.replace(report/'review.html')

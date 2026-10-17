@@ -1,7 +1,9 @@
 """Garment colors from confident body keypoints, excluding bbox background."""
 from pathlib import Path
+import json
 import cv2
 import numpy as np
+from cache_io import atomic_npz,load_npz
 
 COLOR_NAMES = ['dark','gray','light','red','orange','yellow','green','cyan','blue','purple']
 VERSION = 1
@@ -61,21 +63,32 @@ def garment_features(crop, points):
 
 
 class ClothingExtractor:
-    def __init__(self, model, device, refresh=False,stop_check=None):
+    def __init__(self, model, device, refresh=False,stop_check=None,cache_signature=None):
         self.model,self.device = model,device
         self.refresh = refresh
         self.stop_check=stop_check or (lambda:None)
+        self.cache_signature = json.dumps([VERSION,cache_signature],sort_keys=True)
 
     def extract(self, folder, count, indices=None):
+        self.stop_check()
         indices = np.arange(count) if indices is None else np.asarray(indices,dtype=int)
         cache = Path(folder)/f'clothing_v{VERSION}.npz'
         hist = np.zeros((count,2,len(COLOR_NAMES)),np.float32)
         valid = np.zeros((count,2),bool)
         done = np.zeros(count,bool)
         if cache.exists() and not self.refresh:
-            with np.load(cache,allow_pickle=False) as data:
-                if len(data['done']) == count:
-                    hist,valid,done = data['hist'],data['valid'],data['done']
+            data = load_npz(cache)
+            try:
+                compatible = (data is not None and str(data['signature'].item()) == self.cache_signature
+                    and data['hist'].shape == hist.shape and data['valid'].shape == valid.shape
+                    and data['done'].shape == done.shape and data['valid'].dtype == np.bool_
+                    and data['done'].dtype == np.bool_ and np.issubdtype(data['hist'].dtype,np.number)
+                    and np.isfinite(data['hist']).all() and (data['hist'] >= 0).all()
+                    and (data['hist'] <= 1).all())
+            except (KeyError,TypeError,ValueError):
+                compatible = False
+            if compatible:
+                hist,valid,done = data['hist'],data['valid'],data['done']
         pending = [int(i) for i in indices if not done[i]]
         for start in range(0,len(pending),16):
             self.stop_check()
@@ -84,6 +97,8 @@ class ClothingExtractor:
             if any(c is None for c in crops):
                 raise RuntimeError('Missing cached person crop')
             results = self.model.predict(crops,imgsz=512,device=self.device,conf=.25,verbose=False)
+            if len(results) != len(group):
+                raise RuntimeError('Pose model returned an incomplete batch')
             for i,crop,result in zip(group,crops,results):
                 if result.keypoints is not None and len(result.keypoints):
                     # Crop already contains one detected person; choose largest pose.
@@ -92,7 +107,10 @@ class ClothingExtractor:
                     points = result.keypoints.data[person].cpu().numpy()
                     hist[i],valid[i],_ = garment_features(crop,points)
                 done[i] = True
-        np.savez_compressed(cache,hist=hist,valid=valid,done=done)
+            # Keep finished batches on cancellation, and leave a full cache hit
+            # read-only instead of recompressing it for every review run.
+            atomic_npz(cache,hist=hist,valid=valid,done=done,signature=np.asarray(self.cache_signature))
+            self.stop_check()
         return hist,valid
 
 
